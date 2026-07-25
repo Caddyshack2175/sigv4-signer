@@ -203,7 +203,7 @@ func TestFetchBurpCredentials(t *testing.T) {
 }
 
 func TestInferSigningScope(t *testing.T) {
-	region, service, err := inferSigningScope("https://abc.execute-api.eu-west-2.amazonaws.com/prod")
+	region, service, err := inferSigningScope("https://abc.api.eu-west-1.amazonaws.com/prod")
 	if err != nil {
 		t.Fatalf("inferSigningScope returned error: %v", err)
 	}
@@ -223,21 +223,21 @@ func TestInferSigningScope_AppSync(t *testing.T) {
 }
 
 func TestInferSigningScope_GenericServiceRegionHost(t *testing.T) {
-	region, service, err := inferSigningScope("https://sts.eu-west-2.amazonaws.com/")
+	region, service, err := inferSigningScope("https://sts.eu-west-1.amazonaws.com/")
 	if err != nil {
 		t.Fatalf("inferSigningScope returned error: %v", err)
 	}
-	if region != "eu-west-2" || service != "sts" {
-		t.Errorf("scope = %s/%s, want eu-west-2/sts", region, service)
+	if region != "eu-west-1" || service != "sts" {
+		t.Errorf("scope = %s/%s, want eu-west-1/sts", region, service)
 	}
 }
 
 func TestInferSigningScope_VirtualHostedS3Bucket(t *testing.T) {
-	region, service, err := inferSigningScope("https://my-bucket.s3.eu-west-2.amazonaws.com/key")
+	region, service, err := inferSigningScope("https://my-bucket.s3.eu-west-1.amazonaws.com/key")
 	if err != nil {
 		t.Fatalf("inferSigningScope returned error: %v", err)
 	}
-	if region != "eu-west-2" || service != "s3" {
+	if region != "eu-west-1" || service != "s3" {
 		t.Errorf("scope = %s/%s, want eu-west-1/s3", region, service)
 	}
 }
@@ -620,7 +620,7 @@ func TestLoadCredentials_FallsBackToBurpWhenYAMLMissing(t *testing.T) {
 	configPath := filepath.Join(dir, "credentials.yaml") // absent
 	burpPath := writeBurpRequest(t, server.URL)
 
-	cfg, source, err := loadCredentials(configPath, burpPath, "https://abc.execute-api.eu-west-2.amazonaws.com/prod", "", "")
+	cfg, source, err := loadCredentials(configPath, burpPath, "https://abc.api.eu-west-1.amazonaws.com/prod", "", "")
 	if err != nil {
 		t.Fatalf("loadCredentials returned error: %v", err)
 	}
@@ -654,7 +654,7 @@ func TestLoadCredentials_BurpCredentialsMissingSecretKeyFailsValidation(t *testi
 	configPath := filepath.Join(dir, "credentials.yaml") // absent
 	burpPath := writeBurpRequest(t, server.URL)
 
-	_, _, err := loadCredentials(configPath, burpPath, "https://abc.execute-api.eu-west-2.amazonaws.com/prod", "", "")
+	_, _, err := loadCredentials(configPath, burpPath, "https://abc.api.eu-west-1.amazonaws.com/prod", "", "")
 	if err == nil || !strings.Contains(err.Error(), "secret key") {
 		t.Errorf("expected an error mentioning the missing secret key, got %v", err)
 	}
@@ -670,7 +670,7 @@ func TestLoadCredentials_CustomDomainRequiresBothOverrides(t *testing.T) {
 	configPath := filepath.Join(dir, "credentials.yaml") // absent
 	burpPath := writeBurpRequest(t, server.URL)
 
-	_, _, err := loadCredentials(configPath, burpPath, "https://api.example.com/items", "eu-west-2", "")
+	_, _, err := loadCredentials(configPath, burpPath, "https://api.example.com/items", "eu-west-1", "")
 	if err == nil || !strings.Contains(err.Error(), "-r and -s") {
 		t.Errorf("expected an error requiring both -r and -s, got %v", err)
 	}
@@ -686,12 +686,12 @@ func TestLoadCredentials_CustomDomainWithBothOverridesSucceeds(t *testing.T) {
 	configPath := filepath.Join(dir, "credentials.yaml") // absent
 	burpPath := writeBurpRequest(t, server.URL)
 
-	cfg, _, err := loadCredentials(configPath, burpPath, "https://api.example.com/items", "eu-west-2", "custom-service")
+	cfg, _, err := loadCredentials(configPath, burpPath, "https://api.example.com/items", "eu-west-1", "custom-service")
 	if err != nil {
 		t.Fatalf("loadCredentials returned error: %v", err)
 	}
-	if cfg.Credentials.Region != "eu-west-2" || cfg.Credentials.SigningService != "custom-service" {
-		t.Errorf("scope = %s/%s, want eu-west-2/custom-service", cfg.Credentials.Region, cfg.Credentials.SigningService)
+	if cfg.Credentials.Region != "eu-west-1" || cfg.Credentials.SigningService != "custom-service" {
+		t.Errorf("scope = %s/%s, want eu-west-1/custom-service", cfg.Credentials.Region, cfg.Credentials.SigningService)
 	}
 }
 
@@ -706,7 +706,7 @@ func TestLoadCredentials_OverrideTakesPrecedenceOverInferred(t *testing.T) {
 	burpPath := writeBurpRequest(t, server.URL)
 
 	// Region is inferable from the URL; only the service is overridden.
-	cfg, _, err := loadCredentials(configPath, burpPath, "https://abc.execute-api.eu-west-2.amazonaws.com/prod", "", "custom-service")
+	cfg, _, err := loadCredentials(configPath, burpPath, "https://abc.api.eu-west-1.amazonaws.com/prod", "", "custom-service")
 	if err != nil {
 		t.Fatalf("loadCredentials returned error: %v", err)
 	}
@@ -723,7 +723,7 @@ func TestLoadCredentials_OverrideTakesPrecedenceOverInferred(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 var authHeaderPattern = regexp.MustCompile(
-	`^AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/\d{8}/eu-west-2/execute-api/aws4_request, SignedHeaders=[a-z0-9;-]+, Signature=[0-9a-f]{64}$`,
+	`^AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/\d{8}/eu-west-1/api/aws4_request, SignedHeaders=[a-z0-9;-]+, Signature=[0-9a-f]{64}$`,
 )
 
 func testConfig() *Config {
