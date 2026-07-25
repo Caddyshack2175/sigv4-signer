@@ -50,7 +50,7 @@ func main() {
 	method := flag.String("X", "GET", "HTTP method (GET, POST, PUT, PATCH, DELETE)")
 	body := flag.String("b", "", "Request body (JSON string)")
 	configFile := flag.String("c", "credentials.yaml", "Path to credentials YAML file")
-	burpFile := flag.String("B", "credentials.burp", "Path to Burp credential request")
+	burpFile := flag.String("B", "credentials-burp.txt", "Path to Burp credential request")
 	region := flag.String("r", "", "AWS signing region (inferred from AWS URL when omitted)")
 	service := flag.String("s", "", "AWS signing service (inferred from AWS URL when omitted)")
 	outputFile := flag.String("o", "", "Replay -B, write resolved credentials to this YAML file, and exit (no request is sent; -r and -s are required)")
