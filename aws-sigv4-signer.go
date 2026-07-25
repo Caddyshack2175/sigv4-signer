@@ -98,7 +98,7 @@ func main() {
 
 	url := args[0]
 
-	cfg, err := loadCredentials(*configFile, *burpFile, url, *region, *service)
+	cfg, _, err := loadCredentials(*configFile, *burpFile, url, *region, *service)
 	if err != nil {
 		log.Fatal("Failed to load credentials: ", err)
 	}
