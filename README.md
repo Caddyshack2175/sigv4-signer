@@ -86,7 +86,7 @@ save it as `credentials.burp` in the directory where you run the signer. Then
 run the signer normally:
 
 ```sh
-./sigv4 https://example.execute-api.eu-west-2.amazonaws.com/prod/items
+./sigv4 https://example.api.eu-west-1.amazonaws.com/prod/items
 ```
 
 Credential source precedence is:
@@ -121,7 +121,7 @@ inferred from a destination URL, so `-r` and `-s` are required. Reuse the
 generated file for as long as the temporary credentials remain valid:
 
 ```sh
-./sigv4 -c admin-role.yaml https://example.execute-api.eu-west-2.amazonaws.com/prod/items
+./sigv4 -c admin-role.yaml https://example.api.eu-west-1.amazonaws.com/prod/items
 ```
 
 When the credentials expire, regenerate the file by replaying the Burp
