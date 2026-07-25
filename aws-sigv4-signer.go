@@ -100,7 +100,7 @@ func main() {
 	if err != nil {
 		log.Fatal("Failed to load credentials: ", err)
 	}
-	_ := source
+	
 	//log.Printf("Using credentials from %s", source)
 
 	// Convert body string to bytes
