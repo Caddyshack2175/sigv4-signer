@@ -70,7 +70,7 @@ example, use `execute-api` for API Gateway.
 To keep credentials elsewhere, pass their path with `-c`:
 
 ```sh
-./sigv4 -c /secure/path/credentials.yaml https://example.execute-api.eu-west-2.amazonaws.com/prod
+./sigv4 -c /secure/path/credentials.yaml https://example.api.eu-west-1.amazonaws.com/prod
 ```
 
 ## Usage
@@ -97,7 +97,7 @@ the URL.
 Send a GET request:
 
 ```sh
-./sigv4 https://example.execute-api.eu-west-2.amazonaws.com/prod/items
+./sigv4 https://example.api.eu-west-1.amazonaws.com/prod/items
 ```
 
 Send a POST request with a JSON body:
@@ -105,7 +105,7 @@ Send a POST request with a JSON body:
 ```sh
 ./sigv4 -X POST \
   -b '{"name":"example"}' \
-  https://example.execute-api.eu-west-2.amazonaws.com/prod/items
+  https://example.api.eu-west-1.amazonaws.com/prod/items
 ```
 
 Add one or more headers:
@@ -115,7 +115,7 @@ Add one or more headers:
   -b '{"enabled":true}' \
   -H 'X-Request-ID: 123' \
   -H 'Accept: application/json' \
-  https://example.execute-api.eu-west-2.amazonaws.com/prod/items/42
+  https://example.api.eu-west-1.amazonaws.com/prod/items/42
 ```
 
 Send a DELETE request with a different credentials file:
@@ -123,7 +123,7 @@ Send a DELETE request with a different credentials file:
 ```sh
 ./sigv4 -X DELETE \
   -c /secure/path/api-credentials.yaml \
-  https://example.execute-api.eu-west-2.amazonaws.com/prod/items/42
+  https://example.api.eu-west-1.amazonaws.com/prod/items/42
 ```
 
 ## Request and response behavior
