@@ -51,6 +51,7 @@ func main() {
 	burpFile := flag.String("B", "credentials.burp", "Path to Burp credential request")
 	region := flag.String("r", "", "AWS signing region (inferred from AWS URL when omitted)")
 	service := flag.String("s", "", "AWS signing service (inferred from AWS URL when omitted)")
+	outputFile := flag.String("o", "", "Replay -B, write resolved credentials to this YAML file, and exit (no request is sent; -r and -s are required)")
 	headers := make(headerFlag)
 	flag.Var(&headers, "H", "Custom header (can be used multiple times)")
 
@@ -74,9 +75,18 @@ func main() {
 		fmt.Fprintln(output, `  sigv4 -X POST -b '{"key":"value"}' -H 'X-Custom: value' https://api.example.com/endpoint`)
 		fmt.Fprintln(output, "# All together")
 		fmt.Fprintln(output, `  sigv4 -X POST -b '{"data":"test"}' -H 'X-Request-ID: 123' -c creds.yaml https://api.example.com/endpoint`)
+		fmt.Fprintln(output, "# Generate a credentials.yaml for a role from a Burp request, no URL needed")
+		fmt.Fprintln(output, "  sigv4 -B admin-role.burp -o admin-role.yaml -r eu-west-1 -s api")
 	}
 
 	flag.Parse()
+
+	if *outputFile != "" {
+		if err := generateCredentialsFile(*burpFile, *outputFile, *region, *service); err != nil {
+			log.Fatal("Failed to generate credentials file: ", err)
+		}
+		return
+	}
 
 	args := flag.Args()
 	if len(args) < 1 {
@@ -180,6 +190,43 @@ func loadCredentials(configPath, burpPath, targetURL, regionOverride, serviceOve
 		return nil, "", fmt.Errorf("%s: %w", burpPath, err)
 	}
 	return cfg, burpPath, nil
+}
+
+// generateCredentialsFile replays the Burp request at burpPath, resolves the
+// temporary credentials from its response, and writes them out as a
+// standard credentials.yaml-shaped file at outputPath. It does not contact
+// any target URL, so region and service must be supplied explicitly rather
+// than inferred. This is meant for pre-generating a credentials file per
+// AWS role so it can be reused with -c until the temporary credentials
+// expire, without re-running the Burp auth flow each time.
+func generateCredentialsFile(burpPath, outputPath, region, service string) error {
+	if region == "" || service == "" {
+		return errors.New("generating a credentials file requires both -r and -s")
+	}
+
+	cfg, err := fetchBurpCredentials(burpPath, &http.Client{Timeout: requestTimeout})
+	if err != nil {
+		return fmt.Errorf("%s: %w", burpPath, err)
+	}
+	cfg.Credentials.Region = region
+	cfg.Credentials.SigningService = service
+
+	if err := validateConfig(cfg); err != nil {
+		return fmt.Errorf("%s: %w", burpPath, err)
+	}
+	if err := saveConfig(outputPath, cfg); err != nil {
+		return fmt.Errorf("%s: %w", outputPath, err)
+	}
+	log.Printf("Wrote credentials to %s", outputPath)
+	return nil
+}
+
+func saveConfig(path string, cfg *Config) error {
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
 }
 
 func fetchBurpCredentials(path string, client *http.Client) (*Config, error) {

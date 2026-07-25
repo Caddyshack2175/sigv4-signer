@@ -101,8 +101,8 @@ func TestLoadConfig_Valid(t *testing.T) {
   access_key: "AKIDEXAMPLE"
   secret_key: "secretkey"
   session_token: "sessiontoken"
-  region: "eu-west-2"
-  signing_service: "execute-api"
+  region: "eu-west-1"
+  signing_service: "api"
 `
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("failed to write test config: %v", err)
@@ -122,11 +122,11 @@ func TestLoadConfig_Valid(t *testing.T) {
 	if cfg.Credentials.SessionToken != "sessiontoken" {
 		t.Errorf("SessionToken = %q, want %q", cfg.Credentials.SessionToken, "sessiontoken")
 	}
-	if cfg.Credentials.Region != "eu-west-2" {
-		t.Errorf("Region = %q, want %q", cfg.Credentials.Region, "eu-west-2")
+	if cfg.Credentials.Region != "eu-west-1" {
+		t.Errorf("Region = %q, want %q", cfg.Credentials.Region, "eu-west-1")
 	}
-	if cfg.Credentials.SigningService != "execute-api" {
-		t.Errorf("SigningService = %q, want %q", cfg.Credentials.SigningService, "execute-api")
+	if cfg.Credentials.SigningService != "api" {
+		t.Errorf("SigningService = %q, want %q", cfg.Credentials.SigningService, "api")
 	}
 }
 
@@ -207,8 +207,8 @@ func TestInferSigningScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("inferSigningScope returned error: %v", err)
 	}
-	if region != "eu-west-2" || service != "execute-api" {
-		t.Errorf("scope = %s/%s, want eu-west-2/execute-api", region, service)
+	if region != "eu-west-1" || service != "api" {
+		t.Errorf("scope = %s/%s, want eu-west-1/api", region, service)
 	}
 }
 
@@ -238,7 +238,7 @@ func TestInferSigningScope_VirtualHostedS3Bucket(t *testing.T) {
 		t.Fatalf("inferSigningScope returned error: %v", err)
 	}
 	if region != "eu-west-2" || service != "s3" {
-		t.Errorf("scope = %s/%s, want eu-west-2/s3", region, service)
+		t.Errorf("scope = %s/%s, want eu-west-1/s3", region, service)
 	}
 }
 
@@ -466,6 +466,103 @@ func TestFirstNonEmpty(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// saveConfig / generateCredentialsFile
+// ---------------------------------------------------------------------------
+
+func TestSaveConfig_RoundTrip(t *testing.T) {
+	cfg := testConfig()
+	path := filepath.Join(t.TempDir(), "out.yaml")
+
+	if err := saveConfig(path, cfg); err != nil {
+		t.Fatalf("saveConfig returned error: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat output file: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("file mode = %o, want %o (credentials should not be world/group readable)", perm, 0o600)
+	}
+
+	got, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig on saved file returned error: %v", err)
+	}
+	if *got != *cfg {
+		t.Errorf("round-tripped config = %+v, want %+v", *got, *cfg)
+	}
+}
+
+func TestGenerateCredentialsFile_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"Credentials":{"AccessKeyId":"AKIDEXAMPLE","SecretKey":"secretvalue","SessionToken":"tokvalue"}}`)
+	}))
+	defer server.Close()
+
+	burpPath := writeBurpRequest(t, server.URL)
+	outputPath := filepath.Join(t.TempDir(), "role.yaml")
+
+	if err := generateCredentialsFile(burpPath, outputPath, "eu-west-1", "api"); err != nil {
+		t.Fatalf("generateCredentialsFile returned error: %v", err)
+	}
+
+	cfg, err := loadConfig(outputPath)
+	if err != nil {
+		t.Fatalf("loadConfig on generated file returned error: %v", err)
+	}
+	if cfg.Credentials.AccessKey != "AKIDEXAMPLE" || cfg.Credentials.SecretKey != "secretvalue" || cfg.Credentials.SessionToken != "tokvalue" {
+		t.Errorf("generated credentials = %+v, want AKIDEXAMPLE/secretvalue/tokvalue", cfg.Credentials)
+	}
+	if cfg.Credentials.Region != "eu-west-1" || cfg.Credentials.SigningService != "api" {
+		t.Errorf("scope = %s/%s, want eu-west-1/api", cfg.Credentials.Region, cfg.Credentials.SigningService)
+	}
+}
+
+func TestGenerateCredentialsFile_RequiresRegionAndService(t *testing.T) {
+	burpPath := filepath.Join(t.TempDir(), "unused.burp") // never read; should fail before that
+
+	cases := []struct{ region, service string }{
+		{"", ""},
+		{"eu-west-1", ""},
+		{"", "api"},
+	}
+	for _, c := range cases {
+		err := generateCredentialsFile(burpPath, filepath.Join(t.TempDir(), "out.yaml"), c.region, c.service)
+		if err == nil {
+			t.Errorf("region=%q service=%q: expected an error requiring both -r and -s, got nil", c.region, c.service)
+		}
+	}
+}
+
+func TestGenerateCredentialsFile_PropagatesFetchError(t *testing.T) {
+	burpPath := filepath.Join(t.TempDir(), "does-not-exist.burp")
+	err := generateCredentialsFile(burpPath, filepath.Join(t.TempDir(), "out.yaml"), "eu-west-1", "api")
+	if err == nil {
+		t.Error("expected an error for a missing Burp file, got nil")
+	}
+}
+
+func TestGenerateCredentialsFile_ValidationErrorWhenSecretKeyMissing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// STS-shaped response: "SecretAccessKey" instead of Cognito's "SecretKey".
+		_, _ = io.WriteString(w, `{"Credentials":{"AccessKeyId":"AKIDEXAMPLE","SecretAccessKey":"secret","SessionToken":"token"}}`)
+	}))
+	defer server.Close()
+
+	burpPath := writeBurpRequest(t, server.URL)
+	outputPath := filepath.Join(t.TempDir(), "role.yaml")
+
+	err := generateCredentialsFile(burpPath, outputPath, "eu-west-1", "api")
+	if err == nil || !strings.Contains(err.Error(), "secret key") {
+		t.Errorf("expected an error mentioning the missing secret key, got %v", err)
+	}
+	if _, statErr := os.Stat(outputPath); statErr == nil {
+		t.Error("output file should not be written when validation fails")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // loadCredentials (YAML + Burp fallback integration)
 // ---------------------------------------------------------------------------
 
@@ -475,8 +572,8 @@ func TestLoadCredentials_UsesYAMLWhenPresent(t *testing.T) {
 	content := `credentials:
   access_key: "AKIDEXAMPLE"
   secret_key: "secretkey"
-  region: "eu-west-2"
-  signing_service: "execute-api"
+  region: "eu-west-1"
+  signing_service: "api"
 `
 	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -530,8 +627,8 @@ func TestLoadCredentials_FallsBackToBurpWhenYAMLMissing(t *testing.T) {
 	if source != burpPath {
 		t.Errorf("source = %q, want %q", source, burpPath)
 	}
-	if cfg.Credentials.Region != "eu-west-2" || cfg.Credentials.SigningService != "execute-api" {
-		t.Errorf("scope = %s/%s, want eu-west-2/execute-api", cfg.Credentials.Region, cfg.Credentials.SigningService)
+	if cfg.Credentials.Region != "eu-west-1" || cfg.Credentials.SigningService != "api" {
+		t.Errorf("scope = %s/%s, want eu-west-1/api", cfg.Credentials.Region, cfg.Credentials.SigningService)
 	}
 }
 
@@ -613,8 +710,8 @@ func TestLoadCredentials_OverrideTakesPrecedenceOverInferred(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadCredentials returned error: %v", err)
 	}
-	if cfg.Credentials.Region != "eu-west-2" {
-		t.Errorf("Region = %q, want inferred %q", cfg.Credentials.Region, "eu-west-2")
+	if cfg.Credentials.Region != "eu-west-1" {
+		t.Errorf("Region = %q, want inferred %q", cfg.Credentials.Region, "eu-west-1")
 	}
 	if cfg.Credentials.SigningService != "custom-service" {
 		t.Errorf("SigningService = %q, want override %q", cfg.Credentials.SigningService, "custom-service")
@@ -634,8 +731,8 @@ func testConfig() *Config {
 	cfg.Credentials.AccessKey = "AKIDEXAMPLE"
 	cfg.Credentials.SecretKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 	cfg.Credentials.SessionToken = ""
-	cfg.Credentials.Region = "eu-west-2"
-	cfg.Credentials.SigningService = "execute-api"
+	cfg.Credentials.Region = "eu-west-1"
+	cfg.Credentials.SigningService = "api"
 	return cfg
 }
 

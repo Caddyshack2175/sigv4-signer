@@ -98,11 +98,35 @@ For standard AWS endpoints, the signing service and region are inferred from
 the destination URL. For custom domains, specify both explicitly:
 
 ```sh
-./sigv4 -r eu-west-2 -s execute-api https://api.example.com/items
+./sigv4 -r eu-west-1 -s api https://api.example.com/items
 ```
 
 The Burp request can contain authentication tokens and must be protected like a
 password. `credentials.burp` is ignored by Git by default.
+
+### Pre-generate a credentials.yaml for a role
+
+When testing multiple IAM roles, replaying the Burp request on every single
+call re-runs the whole auth flow each time. Instead, `-o` replays it once and
+writes the resolved temporary credentials to a plain `credentials.yaml`-shaped
+file, then exits without sending anything to a target URL:
+
+```sh
+./sigv4 -B admin-role.burp -o admin-role.yaml -r eu-west-1 -s api
+./sigv4 -B readonly-role.burp -o readonly-role.yaml -r eu-west-1 -s api
+```
+
+Because no request is sent in this mode, region and service cannot be
+inferred from a destination URL, so `-r` and `-s` are required. Reuse the
+generated file for as long as the temporary credentials remain valid:
+
+```sh
+./sigv4 -c admin-role.yaml https://example.execute-api.eu-west-2.amazonaws.com/prod/items
+```
+
+When the credentials expire, regenerate the file by replaying the Burp
+request again. `-o` output files contain live secrets and should be treated
+the same as `credentials.yaml`.
 
 ## Usage
 
@@ -120,6 +144,9 @@ Options:
         Request body (JSON string)
   -c string
         Path to credentials YAML file (default "credentials.yaml")
+  -o string
+        Replay -B, write resolved credentials to this YAML file, and exit
+        (no request is sent; -r and -s are required)
   -r string
         AWS signing region
   -s string
