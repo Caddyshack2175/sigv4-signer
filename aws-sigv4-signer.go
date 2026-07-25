@@ -11,15 +11,19 @@ ToDo:
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -30,7 +34,8 @@ import (
 )
 
 const (
-	requestTimeout = 30 * time.Second
+	requestTimeout            = 30 * time.Second
+	maxCredentialResponseSize = 2 << 20
 )
 
 /*
@@ -43,6 +48,9 @@ func main() {
 	method := flag.String("X", "GET", "HTTP method (GET, POST, PUT, PATCH, DELETE)")
 	body := flag.String("b", "", "Request body (JSON string)")
 	configFile := flag.String("c", "credentials.yaml", "Path to credentials YAML file")
+	burpFile := flag.String("B", "credentials.burp", "Path to Burp credential request")
+	region := flag.String("r", "", "AWS signing region (inferred from AWS URL when omitted)")
+	service := flag.String("s", "", "AWS signing service (inferred from AWS URL when omitted)")
 	headers := make(headerFlag)
 	flag.Var(&headers, "H", "Custom header (can be used multiple times)")
 
@@ -78,10 +86,11 @@ func main() {
 
 	url := args[0]
 
-	cfg, err := loadConfig(*configFile)
+	cfg, source, err := loadCredentials(*configFile, *burpFile, url, *region, *service)
 	if err != nil {
-		log.Fatal("Failed to load config:", err)
+		log.Fatal("Failed to load credentials: ", err)
 	}
+	log.Printf("Using credentials from %s", source)
 
 	// Convert body string to bytes
 	var bodyBytes []byte
@@ -127,6 +136,202 @@ func loadConfig(filepath string) (*Config, error) {
 	}
 	return &cfg, nil
 }
+
+// ---------------------------------------------------------------------------
+// Credential loading: credentials.yaml or a replayed Burp request
+// ---------------------------------------------------------------------------
+
+type cognitoCredentialResponse struct {
+	Credentials struct {
+		AccessKeyID  string  `json:"AccessKeyId"`
+		SecretKey    string  `json:"SecretKey"`
+		SessionToken string  `json:"SessionToken"`
+		Expiration   float64 `json:"Expiration"`
+	} `json:"Credentials"`
+}
+
+func loadCredentials(configPath, burpPath, targetURL, regionOverride, serviceOverride string) (*Config, string, error) {
+	cfg, err := loadConfig(configPath)
+	if err == nil {
+		if err := validateConfig(cfg); err != nil {
+			return nil, "", fmt.Errorf("%s: %w", configPath, err)
+		}
+		return cfg, configPath, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, "", fmt.Errorf("%s: %w", configPath, err)
+	}
+
+	cfg, err = fetchBurpCredentials(burpPath, &http.Client{Timeout: requestTimeout})
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, "", fmt.Errorf("neither %s nor %s exists", configPath, burpPath)
+		}
+		return nil, "", fmt.Errorf("%s: %w", burpPath, err)
+	}
+
+	inferredRegion, inferredService, err := inferSigningScope(targetURL)
+	if err != nil && (regionOverride == "" || serviceOverride == "") {
+		return nil, "", fmt.Errorf("%w; set both -r and -s for a custom endpoint", err)
+	}
+	cfg.Credentials.Region = firstNonEmpty(regionOverride, inferredRegion)
+	cfg.Credentials.SigningService = firstNonEmpty(serviceOverride, inferredService)
+	if err := validateConfig(cfg); err != nil {
+		return nil, "", fmt.Errorf("%s: %w", burpPath, err)
+	}
+	return cfg, burpPath, nil
+}
+
+func fetchBurpCredentials(path string, client *http.Client) (*Config, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	req, err := parseBurpRequest(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("credential request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCredentialResponseSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read credential response: %w", err)
+	}
+	if len(body) > maxCredentialResponseSize {
+		return nil, fmt.Errorf("credential response exceeds %d bytes", maxCredentialResponseSize)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("credential endpoint returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	var result cognitoCredentialResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("decode credential response: %w", err)
+	}
+	cfg := &Config{}
+	cfg.Credentials.AccessKey = result.Credentials.AccessKeyID
+	cfg.Credentials.SecretKey = result.Credentials.SecretKey
+	cfg.Credentials.SessionToken = result.Credentials.SessionToken
+	return cfg, nil
+}
+
+func parseBurpRequest(raw []byte) (*http.Request, error) {
+	normalized := bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n"))
+	parts := bytes.SplitN(normalized, []byte("\n\n"), 2)
+	if len(parts) != 2 {
+		return nil, errors.New("Burp request has no header/body separator")
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(parts[0]))
+	if !scanner.Scan() {
+		return nil, errors.New("Burp request is empty")
+	}
+	requestLine := strings.Fields(scanner.Text())
+	if len(requestLine) != 3 {
+		return nil, fmt.Errorf("invalid request line %q", scanner.Text())
+	}
+
+	headers := make(http.Header)
+	var host string
+	for scanner.Scan() {
+		line := scanner.Text()
+		name, value, ok := strings.Cut(line, ":")
+		if !ok {
+			return nil, fmt.Errorf("invalid header line %q", line)
+		}
+		name, value = strings.TrimSpace(name), strings.TrimSpace(value)
+		if strings.EqualFold(name, "Host") {
+			host = value
+			continue
+		}
+		if shouldCopyBurpHeader(name) {
+			headers.Add(name, value)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read Burp headers: %w", err)
+	}
+	if host == "" {
+		return nil, errors.New("Burp request is missing Host header")
+	}
+
+	requestURL := requestLine[1]
+	if parsed, err := url.Parse(requestURL); err != nil || !parsed.IsAbs() {
+		requestURL = "https://" + host + requestURL
+	}
+	req, err := http.NewRequest(requestLine[0], requestURL, bytes.NewReader(parts[1]))
+	if err != nil {
+		return nil, fmt.Errorf("create credential request: %w", err)
+	}
+	req.Header = headers
+	req.Host = host
+	return req, nil
+}
+
+func shouldCopyBurpHeader(name string) bool {
+	switch strings.ToLower(name) {
+	case "content-length", "accept-encoding", "connection", "proxy-connection", "te":
+		return false
+	default:
+		return true
+	}
+}
+
+func inferSigningScope(rawURL string) (string, string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Hostname() == "" {
+		return "", "", fmt.Errorf("cannot infer signing scope from URL %q", rawURL)
+	}
+	labels := strings.Split(parsed.Hostname(), ".")
+	for i, label := range labels {
+		if label == "execute-api" && i+1 < len(labels) {
+			return labels[i+1], "execute-api", nil
+		}
+		if label == "appsync-api" && i+1 < len(labels) {
+			return labels[i+1], "appsync", nil
+		}
+	}
+	if len(labels) >= 4 && labels[len(labels)-2] == "amazonaws" {
+		return labels[len(labels)-3], labels[len(labels)-4], nil
+	}
+	return "", "", fmt.Errorf("cannot infer AWS region and service from host %q", parsed.Hostname())
+}
+
+func validateConfig(cfg *Config) error {
+	missing := make([]string, 0, 4)
+	if cfg.Credentials.AccessKey == "" {
+		missing = append(missing, "access key")
+	}
+	if cfg.Credentials.SecretKey == "" {
+		missing = append(missing, "secret key")
+	}
+	if cfg.Credentials.Region == "" {
+		missing = append(missing, "region")
+	}
+	if cfg.Credentials.SigningService == "" {
+		missing = append(missing, "signing service")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// ---------------------------------------------------------------------------
 
 func calculatePayloadHash(body []byte) string {
 	if len(body) == 0 {

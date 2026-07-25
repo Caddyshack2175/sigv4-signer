@@ -11,6 +11,7 @@ The tool supports:
 - JSON request bodies
 - Repeated custom headers
 - Long-lived AWS credentials or temporary credentials with a session token
+- Automatic temporary credential retrieval from a Burp request file
 - Configurable AWS region and signing service
 - A 30-second request timeout
 
@@ -73,20 +74,56 @@ To keep credentials elsewhere, pass their path with `-c`:
 ./sigv4 -c /secure/path/credentials.yaml https://example.api.eu-west-1.amazonaws.com/prod
 ```
 
+## Retrieve temporary credentials from a Burp request
+
+If `credentials.yaml` is absent and `credentials.burp` is present, the tool
+replays the HTTP request captured in that Burp file and reads temporary AWS
+credentials from the JSON response. Credentials remain in memory and are not
+written to disk.
+
+In Burp Suite, use **Copy to file** on the credential-generating request and
+save it as `credentials.burp` in the directory where you run the signer. Then
+run the signer normally:
+
+```sh
+./sigv4 https://example.execute-api.eu-west-2.amazonaws.com/prod/items
+```
+
+Credential source precedence is:
+
+1. The YAML file selected by `-c` (default `credentials.yaml`)
+2. The Burp request selected by `-B` (default `credentials.burp`)
+
+For standard AWS endpoints, the signing service and region are inferred from
+the destination URL. For custom domains, specify both explicitly:
+
+```sh
+./sigv4 -r eu-west-2 -s execute-api https://api.example.com/items
+```
+
+The Burp request can contain authentication tokens and must be protected like a
+password. `credentials.burp` is ignored by Git by default.
+
 ## Usage
 
 ```text
 sigv4 [options] <url>
 
 Options:
+  -B string
+        Path to Burp credential request (default "credentials.burp")
+  -H value
+        Custom header in "Key: Value" form; may be repeated
   -X string
         HTTP method (GET, POST, PUT, PATCH, DELETE) (default "GET")
   -b string
         Request body (JSON string)
   -c string
         Path to credentials YAML file (default "credentials.yaml")
-  -H value
-        Custom header in "Key: Value" form; may be repeated
+  -r string
+        AWS signing region
+  -s string
+        AWS signing service
 ```
 
 The URL must include its scheme, such as `https://`. Options must appear before
@@ -143,10 +180,11 @@ cd sigv4-signer
 make test
 ```
 
-The automated suite covers payload hashing, header parsing, configuration
-loading, SigV4 authorization headers, request bodies, custom headers, temporary
-credential session tokens, response output, and common failure paths. The HTTP
-tests use a local in-process test server and do not call AWS.
+The automated suite covers payload hashing, header parsing, YAML and Burp
+credential loading, signing-scope inference, SigV4 authorization headers,
+request bodies, custom headers, temporary credential session tokens, response
+output, and common failure paths. The HTTP tests use local in-process test
+servers and do not call AWS.
 
 Additional targets:
 
@@ -161,8 +199,8 @@ make clean    # Remove the local build
 
 ```text
 sigv4-signer/
-├── aws-sigv4-signer_v3.go  # CLI and signing implementation
-├── aws-sigv4-signer_v3_test.go
+├── aws-sigv4-signer.go     # CLI, signing, and credential loading (YAML + Burp)
+├── aws-sigv4-signer_test.go
 ├── credentials.example.yaml
 ├── go.mod                  # Go module definition
 ├── go.sum                  # Dependency checksums

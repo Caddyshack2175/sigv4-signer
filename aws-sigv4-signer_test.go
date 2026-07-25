@@ -150,6 +150,477 @@ func TestLoadConfig_MalformedYAML(t *testing.T) {
 	}
 }
 
+func TestParseBurpRequest(t *testing.T) {
+	raw := "POST / HTTP/2\r\nHost: cognito-identity.eu-west-1.amazonaws.com\r\nContent-Type: application/x-amz-json-1.1\r\nContent-Length: 2\r\n\r\n{}"
+	req, err := parseBurpRequest([]byte(raw))
+	if err != nil {
+		t.Fatalf("parseBurpRequest returned error: %v", err)
+	}
+	if req.Method != http.MethodPost {
+		t.Errorf("method = %q, want POST", req.Method)
+	}
+	if req.URL.String() != "https://cognito-identity.eu-west-1.amazonaws.com/" {
+		t.Errorf("URL = %q", req.URL.String())
+	}
+	if req.Header.Get("Content-Length") != "" {
+		t.Error("captured Content-Length should be recalculated")
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != "{}" {
+		t.Errorf("body = %q, want {}", body)
+	}
+}
+
+func TestFetchBurpCredentials(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Amz-Target") != "AWSCognitoIdentityService.GetCredentialsForIdentity" {
+			t.Errorf("unexpected X-Amz-Target %q", r.Header.Get("X-Amz-Target"))
+		}
+		w.Header().Set("Content-Type", "application/x-amz-json-1.1")
+		_, _ = io.WriteString(w, `{"Credentials":{"AccessKeyId":"AKIDEXAMPLE","SecretKey":"secret","SessionToken":"token","Expiration":1784816088}}`)
+	}))
+	defer server.Close()
+
+	host := strings.TrimPrefix(server.URL, "http://")
+	raw := "POST " + server.URL + "/ HTTP/1.1\nHost: " + host + "\nX-Amz-Target: AWSCognitoIdentityService.GetCredentialsForIdentity\n\n{}"
+	path := filepath.Join(t.TempDir(), "credentials.burp")
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatalf("write Burp request: %v", err)
+	}
+
+	cfg, err := fetchBurpCredentials(path, server.Client())
+	if err != nil {
+		t.Fatalf("fetchBurpCredentials returned error: %v", err)
+	}
+	if cfg.Credentials.AccessKey != "AKIDEXAMPLE" ||
+		cfg.Credentials.SecretKey != "secret" ||
+		cfg.Credentials.SessionToken != "token" {
+		t.Error("response credentials were not mapped correctly")
+	}
+}
+
+func TestInferSigningScope(t *testing.T) {
+	region, service, err := inferSigningScope("https://abc.execute-api.eu-west-2.amazonaws.com/prod")
+	if err != nil {
+		t.Fatalf("inferSigningScope returned error: %v", err)
+	}
+	if region != "eu-west-2" || service != "execute-api" {
+		t.Errorf("scope = %s/%s, want eu-west-2/execute-api", region, service)
+	}
+}
+
+func TestInferSigningScope_AppSync(t *testing.T) {
+	region, service, err := inferSigningScope("https://xyz.appsync-api.us-east-1.amazonaws.com/graphql")
+	if err != nil {
+		t.Fatalf("inferSigningScope returned error: %v", err)
+	}
+	if region != "us-east-1" || service != "appsync" {
+		t.Errorf("scope = %s/%s, want us-east-1/appsync", region, service)
+	}
+}
+
+func TestInferSigningScope_GenericServiceRegionHost(t *testing.T) {
+	region, service, err := inferSigningScope("https://sts.eu-west-2.amazonaws.com/")
+	if err != nil {
+		t.Fatalf("inferSigningScope returned error: %v", err)
+	}
+	if region != "eu-west-2" || service != "sts" {
+		t.Errorf("scope = %s/%s, want eu-west-2/sts", region, service)
+	}
+}
+
+func TestInferSigningScope_VirtualHostedS3Bucket(t *testing.T) {
+	region, service, err := inferSigningScope("https://my-bucket.s3.eu-west-2.amazonaws.com/key")
+	if err != nil {
+		t.Fatalf("inferSigningScope returned error: %v", err)
+	}
+	if region != "eu-west-2" || service != "s3" {
+		t.Errorf("scope = %s/%s, want eu-west-2/s3", region, service)
+	}
+}
+
+func TestInferSigningScope_GlobalServiceWithoutRegionFails(t *testing.T) {
+	_, _, err := inferSigningScope("https://iam.amazonaws.com/")
+	if err == nil {
+		t.Error("expected an error for a region-less global endpoint, got nil")
+	}
+}
+
+func TestInferSigningScope_CustomDomainFails(t *testing.T) {
+	_, _, err := inferSigningScope("https://api.example.com/items")
+	if err == nil {
+		t.Error("expected an error for a non-AWS host, got nil")
+	}
+}
+
+func TestInferSigningScope_InvalidURL(t *testing.T) {
+	_, _, err := inferSigningScope("://not-a-valid-url")
+	if err == nil {
+		t.Error("expected an error for an invalid URL, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// parseBurpRequest edge cases
+// ---------------------------------------------------------------------------
+
+func TestParseBurpRequest_AbsoluteRequestLineURI(t *testing.T) {
+	raw := "GET https://internal.example.com:8443/creds HTTP/1.1\nHost: proxy.local\n\n"
+	req, err := parseBurpRequest([]byte(raw))
+	if err != nil {
+		t.Fatalf("parseBurpRequest returned error: %v", err)
+	}
+	if req.URL.String() != "https://internal.example.com:8443/creds" {
+		t.Errorf("URL = %q, want the absolute URI from the request line", req.URL.String())
+	}
+}
+
+func TestParseBurpRequest_PreservesAuthAndCookieHeaders(t *testing.T) {
+	raw := "GET /creds HTTP/1.1\nHost: example.com\nAuthorization: Bearer abc123\nCookie: session=xyz\n\n"
+	req, err := parseBurpRequest([]byte(raw))
+	if err != nil {
+		t.Fatalf("parseBurpRequest returned error: %v", err)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer abc123" {
+		t.Errorf("Authorization header = %q, want %q", got, "Bearer abc123")
+	}
+	if got := req.Header.Get("Cookie"); got != "session=xyz" {
+		t.Errorf("Cookie header = %q, want %q", got, "session=xyz")
+	}
+}
+
+func TestParseBurpRequest_StripsHopByHopHeaders(t *testing.T) {
+	raw := "GET /creds HTTP/1.1\nHost: example.com\nConnection: keep-alive\nProxy-Connection: keep-alive\nTE: trailers\nAccept-Encoding: gzip\n\n"
+	req, err := parseBurpRequest([]byte(raw))
+	if err != nil {
+		t.Fatalf("parseBurpRequest returned error: %v", err)
+	}
+	for _, name := range []string{"Connection", "Proxy-Connection", "TE", "Accept-Encoding"} {
+		if got := req.Header.Get(name); got != "" {
+			t.Errorf("%s header = %q, want it stripped", name, got)
+		}
+	}
+}
+
+func TestParseBurpRequest_RepeatedHeaderPreservesAllValues(t *testing.T) {
+	raw := "GET /creds HTTP/1.1\nHost: example.com\nCookie: a=1\nCookie: b=2\n\n"
+	req, err := parseBurpRequest([]byte(raw))
+	if err != nil {
+		t.Fatalf("parseBurpRequest returned error: %v", err)
+	}
+	got := req.Header.Values("Cookie")
+	if len(got) != 2 || got[0] != "a=1" || got[1] != "b=2" {
+		t.Errorf("Cookie values = %v, want [a=1 b=2]", got)
+	}
+}
+
+func TestParseBurpRequest_MissingSeparator(t *testing.T) {
+	raw := "GET /creds HTTP/1.1\nHost: example.com\n"
+	if _, err := parseBurpRequest([]byte(raw)); err == nil {
+		t.Error("expected an error when the header/body separator is missing, got nil")
+	}
+}
+
+func TestParseBurpRequest_MissingHostHeader(t *testing.T) {
+	raw := "GET /creds HTTP/1.1\nX-Foo: bar\n\n"
+	if _, err := parseBurpRequest([]byte(raw)); err == nil {
+		t.Error("expected an error when the Host header is missing, got nil")
+	}
+}
+
+func TestParseBurpRequest_InvalidRequestLine(t *testing.T) {
+	raw := "GET\nHost: example.com\n\n"
+	if _, err := parseBurpRequest([]byte(raw)); err == nil {
+		t.Error("expected an error for a malformed request line, got nil")
+	}
+}
+
+func TestParseBurpRequest_InvalidHeaderLine(t *testing.T) {
+	raw := "GET /creds HTTP/1.1\nHost: example.com\nNotAHeader\n\n"
+	if _, err := parseBurpRequest([]byte(raw)); err == nil {
+		t.Error("expected an error for a header line with no colon, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// fetchBurpCredentials edge cases
+// ---------------------------------------------------------------------------
+
+func TestFetchBurpCredentials_MissingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "does-not-exist.burp")
+	_, err := fetchBurpCredentials(path, http.DefaultClient)
+	if !os.IsNotExist(err) {
+		t.Errorf("expected a not-exist error, got %v", err)
+	}
+}
+
+func TestFetchBurpCredentials_NonSuccessStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, "access denied")
+	}))
+	defer server.Close()
+
+	path := writeBurpRequest(t, server.URL)
+	_, err := fetchBurpCredentials(path, server.Client())
+	if err == nil || !strings.Contains(err.Error(), "403") {
+		t.Errorf("expected an error mentioning the 403 status, got %v", err)
+	}
+}
+
+func TestFetchBurpCredentials_ResponseTooLarge(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(make([]byte, maxCredentialResponseSize+1))
+	}))
+	defer server.Close()
+
+	path := writeBurpRequest(t, server.URL)
+	_, err := fetchBurpCredentials(path, server.Client())
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("expected an error about exceeding the size limit, got %v", err)
+	}
+}
+
+func TestFetchBurpCredentials_MalformedJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "not json")
+	}))
+	defer server.Close()
+
+	path := writeBurpRequest(t, server.URL)
+	_, err := fetchBurpCredentials(path, server.Client())
+	if err == nil {
+		t.Error("expected an error for a malformed JSON response, got nil")
+	}
+}
+
+func TestFetchBurpCredentials_STSShapedResponseLeavesSecretKeyEmpty(t *testing.T) {
+	// STS responses use "SecretAccessKey" rather than Cognito's "SecretKey";
+	// this documents that mismatch rather than silently signing with a
+	// missing secret (loadCredentials.validateConfig catches it downstream).
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"Credentials":{"AccessKeyId":"AKIDEXAMPLE","SecretAccessKey":"secret","SessionToken":"token"}}`)
+	}))
+	defer server.Close()
+
+	path := writeBurpRequest(t, server.URL)
+	cfg, err := fetchBurpCredentials(path, server.Client())
+	if err != nil {
+		t.Fatalf("fetchBurpCredentials returned error: %v", err)
+	}
+	if cfg.Credentials.SecretKey != "" {
+		t.Errorf("SecretKey = %q, want empty for an STS-shaped response", cfg.Credentials.SecretKey)
+	}
+}
+
+// writeBurpRequest writes a minimal valid Burp request file targeting the
+// given httptest server URL and returns its path.
+func writeBurpRequest(t *testing.T, serverURL string) string {
+	t.Helper()
+	host := strings.TrimPrefix(serverURL, "http://")
+	raw := "POST " + serverURL + "/ HTTP/1.1\nHost: " + host + "\n\n{}"
+	path := filepath.Join(t.TempDir(), "credentials.burp")
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatalf("write Burp request: %v", err)
+	}
+	return path
+}
+
+// ---------------------------------------------------------------------------
+// validateConfig / firstNonEmpty
+// ---------------------------------------------------------------------------
+
+func TestValidateConfig_MissingFields(t *testing.T) {
+	cfg := &Config{}
+	cfg.Credentials.AccessKey = "AKIDEXAMPLE"
+	err := validateConfig(cfg)
+	if err == nil {
+		t.Fatal("expected an error for incomplete credentials, got nil")
+	}
+	for _, field := range []string{"secret key", "region", "signing service"} {
+		if !strings.Contains(err.Error(), field) {
+			t.Errorf("error %q does not mention missing %q", err.Error(), field)
+		}
+	}
+}
+
+func TestValidateConfig_AllPresent(t *testing.T) {
+	if err := validateConfig(testConfig()); err != nil {
+		t.Errorf("unexpected error for a complete config: %v", err)
+	}
+}
+
+func TestFirstNonEmpty(t *testing.T) {
+	if got := firstNonEmpty("", "", "c"); got != "c" {
+		t.Errorf("firstNonEmpty = %q, want %q", got, "c")
+	}
+	if got := firstNonEmpty("a", "b"); got != "a" {
+		t.Errorf("firstNonEmpty = %q, want %q", got, "a")
+	}
+	if got := firstNonEmpty("", ""); got != "" {
+		t.Errorf("firstNonEmpty = %q, want empty string", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// loadCredentials (YAML + Burp fallback integration)
+// ---------------------------------------------------------------------------
+
+func TestLoadCredentials_UsesYAMLWhenPresent(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "credentials.yaml")
+	content := `credentials:
+  access_key: "AKIDEXAMPLE"
+  secret_key: "secretkey"
+  region: "eu-west-2"
+  signing_service: "execute-api"
+`
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	burpPath := filepath.Join(dir, "credentials.burp") // deliberately absent
+
+	cfg, source, err := loadCredentials(configPath, burpPath, "https://example.com", "", "")
+	if err != nil {
+		t.Fatalf("loadCredentials returned error: %v", err)
+	}
+	if source != configPath {
+		t.Errorf("source = %q, want %q", source, configPath)
+	}
+	if cfg.Credentials.AccessKey != "AKIDEXAMPLE" {
+		t.Errorf("AccessKey = %q, want %q", cfg.Credentials.AccessKey, "AKIDEXAMPLE")
+	}
+}
+
+func TestLoadCredentials_MalformedYAMLDoesNotFallBackToBurp(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "credentials.yaml")
+	if err := os.WriteFile(configPath, []byte("credentials: [not a map"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	burpPath := filepath.Join(dir, "credentials.burp") // absent; would produce a
+	// different ("neither ... exists") error if loadCredentials fell through to it
+
+	_, _, err := loadCredentials(configPath, burpPath, "https://example.com", "", "")
+	if err == nil {
+		t.Fatal("expected an error for malformed YAML, got nil")
+	}
+	if strings.Contains(err.Error(), "neither") {
+		t.Errorf("error %q suggests it fell back to the Burp path instead of failing on the malformed YAML", err.Error())
+	}
+}
+
+func TestLoadCredentials_FallsBackToBurpWhenYAMLMissing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"Credentials":{"AccessKeyId":"AKIDEXAMPLE","SecretKey":"secret","SessionToken":"token"}}`)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "credentials.yaml") // absent
+	burpPath := writeBurpRequest(t, server.URL)
+
+	cfg, source, err := loadCredentials(configPath, burpPath, "https://abc.execute-api.eu-west-2.amazonaws.com/prod", "", "")
+	if err != nil {
+		t.Fatalf("loadCredentials returned error: %v", err)
+	}
+	if source != burpPath {
+		t.Errorf("source = %q, want %q", source, burpPath)
+	}
+	if cfg.Credentials.Region != "eu-west-2" || cfg.Credentials.SigningService != "execute-api" {
+		t.Errorf("scope = %s/%s, want eu-west-2/execute-api", cfg.Credentials.Region, cfg.Credentials.SigningService)
+	}
+}
+
+func TestLoadCredentials_NeitherSourceExists(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "credentials.yaml")
+	burpPath := filepath.Join(dir, "credentials.burp")
+
+	_, _, err := loadCredentials(configPath, burpPath, "https://example.com", "", "")
+	if err == nil || !strings.Contains(err.Error(), "neither") {
+		t.Errorf("expected an error mentioning both missing paths, got %v", err)
+	}
+}
+
+func TestLoadCredentials_BurpCredentialsMissingSecretKeyFailsValidation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// STS-shaped response: "SecretAccessKey" instead of Cognito's "SecretKey".
+		_, _ = io.WriteString(w, `{"Credentials":{"AccessKeyId":"AKIDEXAMPLE","SecretAccessKey":"secret","SessionToken":"token"}}`)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "credentials.yaml") // absent
+	burpPath := writeBurpRequest(t, server.URL)
+
+	_, _, err := loadCredentials(configPath, burpPath, "https://abc.execute-api.eu-west-2.amazonaws.com/prod", "", "")
+	if err == nil || !strings.Contains(err.Error(), "secret key") {
+		t.Errorf("expected an error mentioning the missing secret key, got %v", err)
+	}
+}
+
+func TestLoadCredentials_CustomDomainRequiresBothOverrides(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"Credentials":{"AccessKeyId":"AKIDEXAMPLE","SecretKey":"secret","SessionToken":"token"}}`)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "credentials.yaml") // absent
+	burpPath := writeBurpRequest(t, server.URL)
+
+	_, _, err := loadCredentials(configPath, burpPath, "https://api.example.com/items", "eu-west-2", "")
+	if err == nil || !strings.Contains(err.Error(), "-r and -s") {
+		t.Errorf("expected an error requiring both -r and -s, got %v", err)
+	}
+}
+
+func TestLoadCredentials_CustomDomainWithBothOverridesSucceeds(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"Credentials":{"AccessKeyId":"AKIDEXAMPLE","SecretKey":"secret","SessionToken":"token"}}`)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "credentials.yaml") // absent
+	burpPath := writeBurpRequest(t, server.URL)
+
+	cfg, _, err := loadCredentials(configPath, burpPath, "https://api.example.com/items", "eu-west-2", "custom-service")
+	if err != nil {
+		t.Fatalf("loadCredentials returned error: %v", err)
+	}
+	if cfg.Credentials.Region != "eu-west-2" || cfg.Credentials.SigningService != "custom-service" {
+		t.Errorf("scope = %s/%s, want eu-west-2/custom-service", cfg.Credentials.Region, cfg.Credentials.SigningService)
+	}
+}
+
+func TestLoadCredentials_OverrideTakesPrecedenceOverInferred(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"Credentials":{"AccessKeyId":"AKIDEXAMPLE","SecretKey":"secret","SessionToken":"token"}}`)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "credentials.yaml") // absent
+	burpPath := writeBurpRequest(t, server.URL)
+
+	// Region is inferable from the URL; only the service is overridden.
+	cfg, _, err := loadCredentials(configPath, burpPath, "https://abc.execute-api.eu-west-2.amazonaws.com/prod", "", "custom-service")
+	if err != nil {
+		t.Fatalf("loadCredentials returned error: %v", err)
+	}
+	if cfg.Credentials.Region != "eu-west-2" {
+		t.Errorf("Region = %q, want inferred %q", cfg.Credentials.Region, "eu-west-2")
+	}
+	if cfg.Credentials.SigningService != "custom-service" {
+		t.Errorf("SigningService = %q, want override %q", cfg.Credentials.SigningService, "custom-service")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // signAndSendRequest
 // ---------------------------------------------------------------------------
