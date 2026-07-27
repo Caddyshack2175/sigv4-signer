@@ -53,7 +53,7 @@ credentials:
   secret_key: "YOUR_SECRET_ACCESS_KEY"
   session_token: "YOUR_SESSION_TOKEN"   # required for temporary creds; leave "" for long-lived
   region: "eu-west-1"
-  signing_service: "api"                # must match the target service, e.g. execute-api for API Gateway
+  signing_service: "api"                # must match the target service, e.g. api for API Gateway
 ```
 
 Point at a file elsewhere with `-c`:
